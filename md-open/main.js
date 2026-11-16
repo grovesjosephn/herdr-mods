@@ -1,10 +1,31 @@
 // Open a markdown file in the md-viewer: fuzzy-filter the project's .md files,
-// or type a path. Enter opens beside the focused pane, Shift+Enter in a new tab,
+// or type a path. Enter shows it in this tab's reader (opening one beside the focused pane), Shift+Enter in a new tab,
 // Esc leaves. Recently opened files come first.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, run, theme, props, closeOverlay, focused, shared, setShared, home } from "herdr";
+import { exec, run, theme, props, closeOverlay, focused, shared, setShared, home, panes } from "herdr";
+
+// Which file each tab's reader shows: { [tab]: absolute path }. md-viewer follows it.
+// "md.readers" { [tab]: true } marks tabs whose md-viewer was opened to follow (older ones don't).
+const FOLLOW = "md.follow", READERS = "md.readers";
+const liveTabs = () => new Set(panes().map(p => p.tab));
+const prune = (m) => { const live = liveTabs(); return Object.fromEntries(Object.entries(m ?? {}).filter(([t]) => live.has(t))); };
+
+// Show a markdown file in this tab's reader pane, opening one on the right if there is none.
+// Returns the reader's pane when one already existed.
+function openInReader(abs, f) {
+  const tab = f?.tab;
+  if (!tab) return null;
+  setShared(FOLLOW, { ...prune(shared(FOLLOW)), [tab]: abs });
+  const reader = shared(READERS)?.[tab] ? panes().find(p => p.tab === tab && p.mod === "md-viewer") : null;
+  if (reader) return reader.pane;
+  setShared(READERS, { ...prune(shared(READERS)), [tab]: true });
+  const here = panes().filter(p => p.tab === tab);
+  const anchor = here.find(p => p.pane === f.pane && !p.mod) ?? here.find(p => p.terminal) ?? here[0];
+  run("pane.split", { direction: "right", ...(anchor ? { pane: anchor.pane } : {}), mod: "md-viewer", props: { file: abs, tab } });
+  return null;
+}
 
 const ROWS = 9, ROW_H = 34;
 const base = (p) => p.split("/").pop();
@@ -99,9 +120,9 @@ export default class MdOpen extends View {
     if (!r) return;
     setShared("md.recent", [r.abs, ...(shared("md.recent") ?? []).filter((p) => p !== r.abs)].slice(0, 8));
     closeOverlay(props().overlay);
-    const p = { mod: "md-viewer", props: { file: r.abs } };
-    if (inTab || !this.from?.pane) run("tab.new", { name: base(r.abs), ...p });
-    else run("pane.split", { direction: "right", pane: this.from.pane, ...p });
+    if (inTab || !this.from?.tab) { run("tab.new", { name: base(r.abs), mod: "md-viewer", props: { file: r.abs } }); return; }
+    const reader = openInReader(r.abs, this.from);
+    if (reader) run("pane.focus", { pane: reader });
   }
 
   render() {

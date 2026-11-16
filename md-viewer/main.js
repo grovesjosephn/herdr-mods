@@ -1,8 +1,10 @@
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex, TextView, EditorState, Editor } from "gpui-base";
-import { exec, run, theme, props, readTextFile, watchFolder, appHome, focused } from "herdr";
+import { exec, run, theme, props, readTextFile, watchFolder, appHome, focused, shared } from "herdr";
 
 const MOD = "mods/md-viewer";
+// { [tab]: absolute path }: the files panel and md-open set this tab's entry to switch the reader.
+const FOLLOW = "md.follow";
 // Outside mods/: writes inside the mod folder trigger a hot reload.
 const CACHE = "md-viewer-cache";
 
@@ -16,7 +18,11 @@ const HEADING = [0, 2.0, 1.55, 1.28, 1.1, 1.0, 0.9]; // × body size, by depth
 
 export default class MdViewer extends View {
   init(p, cx) {
-    this.file = props()?.file ?? p?.file ?? null;
+    // The tab this reader follows, given by whoever opened it (files panel, md-open). Without one it just shows `file`.
+    this.tab = props()?.tab ?? p?.tab ?? null;
+    this.followed = this.tab ? shared(FOLLOW)?.[this.tab] ?? null : null;
+    this.file = this.followed ?? props()?.file ?? p?.file ?? null;
+    this.gen = 0;
     this.blocks = [];
     this.editors = new Map();
     this.error = null;
@@ -24,15 +30,31 @@ export default class MdViewer extends View {
     this.files = [];
     this.width = 700;
     this.fs = Number(localStorage.getItem("md.fs")) || 17;
+    if (this.file) this.show(this.file, cx);
+    else cx.spawn(async (cx) => { await this.listFiles(cx); });
+  }
+
+  // Load a file and live-reload it: re-render when it changes. A later show() ends this watch.
+  show(file, cx) {
+    this.file = file;
+    const gen = ++this.gen;
     cx.spawn(async (cx) => {
-      if (!this.file) { await this.listFiles(cx); return; }
       await this.load(cx);
-      for (;;) { // live reload: re-render when a .md next to the file changes
-        const changed = await watchFolder(dirname(this.file));
-        if (changed.some((c) => c === this.file || c.endsWith("/" + this.file.split("/").pop())))
+      for (;;) {
+        const changed = await watchFolder(dirname(file));
+        if (gen !== this.gen) return;
+        if (changed.some((c) => c === file || c.endsWith("/" + file.split("/").pop())))
           await this.load(cx);
       }
     });
+  }
+
+  // Another mod pointed this tab's reader at a new file.
+  follow(cx) {
+    const want = this.tab ? shared(FOLLOW)?.[this.tab] ?? null : null;
+    if (!want || want === this.followed) return;
+    this.followed = want;
+    if (want !== this.file) this.show(want, cx);
   }
 
   async close() { this.releaseEditors(); }
@@ -51,14 +73,16 @@ export default class MdViewer extends View {
   }
 
   async load(cx) {
+    const file = this.file;
     const t = theme();
     const out = `${appHome()}/${CACHE}`;
     const themeJson = JSON.stringify(Object.fromEntries(Object.entries(t).filter(([, v]) => typeof v === "string")));
     let r;
-    try { r = await exec("node", [`${appHome()}/${MOD}/render.mjs`, this.file, out, themeJson]); }
-    catch (e) { this.error = "exec failed: " + String(e?.message ?? e); cx.notify(); return; }
+    try { r = await exec("node", [`${appHome()}/${MOD}/render.mjs`, file, out, themeJson]); }
+    catch (e) { if (file !== this.file) return; this.error = "exec failed: " + String(e?.message ?? e); cx.notify(); return; }
     try {
       const blocks = JSON.parse(await readTextFile(`${out}/${r.stdout.trim()}.json`));
+      if (file !== this.file) return;
       this.releaseEditors();
       blocks.forEach((b, i) => {
         if (b.kind === "code") this.editors.set(i, this.makeEditor(b, t));
@@ -67,6 +91,7 @@ export default class MdViewer extends View {
       this.error = null;
       this.info = (() => { const n = blocks.filter((b) => b.kind.startsWith("mermaid")).length; return n ? `${n} diagram${n > 1 ? "s" : ""}` : null; })();
     } catch {
+      if (file !== this.file) return;
       this.error = (r.stderr || r.stdout || "render failed").slice(0, 600);
     }
     cx.notify();
@@ -95,8 +120,7 @@ export default class MdViewer extends View {
   }
 
   open(f, cx) {
-    this.file = f.startsWith("/") ? f : `${this.base}/${f}`.replace(/\/\.\//g, "/");
-    cx.spawn(async (cx) => { await this.load(cx); });
+    this.show(f.startsWith("/") ? f : `${this.base}/${f}`.replace(/\/\.\//g, "/"), cx);
   }
 
   renderPicker(t) {
@@ -182,6 +206,7 @@ export default class MdViewer extends View {
   }
 
   render(cx) {
+    this.follow(cx);
     const t = theme();
     if (!this.file) return this.renderPicker(t);
     const colW = Math.round(this.fs * 40); // ~66 characters per line
@@ -198,7 +223,7 @@ export default class MdViewer extends View {
         .child(btn("open", "Open…", () => run("mod.open", { name: "md-open" })))
         .child(btn("fs-", "A−", (cx) => this.setSize(this.fs - 1, cx)))
         .child(btn("fs+", "A+", (cx) => this.setSize(this.fs + 1, cx))))
-      .child(v_flex().id("scroll").flex_1().min_h(0).overflow_y_scrollbar()
+      .child(v_flex().id("scroll-" + this.file).flex_1().min_h(0).overflow_y_scrollbar()
         .child(v_flex().w_full().max_w(colW + 56).mx_auto().px(28).pt(8).pb(72).children(kids)));
   }
 }
